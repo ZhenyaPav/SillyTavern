@@ -2945,15 +2945,24 @@ export function getStreamingReply(data, state, { chatCompletionSource = null, ov
             state.images.push(...imageUrls.filter(isDataURL));
         }
         if (show_thoughts) {
-            state.reasoning += (data.choices?.filter(x => x?.delta?.reasoning)?.[0]?.delta?.reasoning || '');
+            state.reasoning +=
+                data.choices?.filter(x => x?.delta?.reasoning)?.[0]?.delta?.reasoning ??
+                data.choices?.filter(x => x?.delta?.reasoning_content)?.[0]?.delta?.reasoning_content ??
+                data.choices?.filter(x => x?.message?.reasoning)?.[0]?.message?.reasoning ??
+                data.choices?.filter(x => x?.message?.reasoning_content)?.[0]?.message?.reasoning_content ??
+                '';
         }
-        // Extract thought signatures from OpenRouter streaming (reasoning_details in delta)
-        const reasoningDetails = data?.choices?.[0]?.delta?.reasoning_details || [];
+        // Extract thought signatures from OpenRouter streaming.
+        const reasoningDetails = [
+            ...(data?.choices?.[0]?.delta?.reasoning_details || []),
+            ...(data?.choices?.[0]?.message?.reasoning_details || []),
+        ];
         reasoningDetails.forEach((detail) => {
             if (detail.type === 'reasoning.encrypted' && detail.data) {
-                if (/^tool_/.test(detail.id)) {
+                if (typeof detail.id === 'string' && detail.id.length > 0) {
                     state.toolSignatures[detail.id] = detail.data;
-                } else {
+                }
+                if (!/^tool_/.test(detail.id)) {
                     state.signature = detail.data;
                 }
             }
