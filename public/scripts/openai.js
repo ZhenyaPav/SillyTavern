@@ -1005,6 +1005,14 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
                 const clone = structuredClone(invocation);
                 if (!reasoningIsEligible) {
                     delete clone.reasoning;
+                } else if (toolReasoningMode === tool_reasoning_modes.ACTIVE_CHAIN) {
+                    // Strict chain mode only forwards reasoning from the latest assistant text boundary.
+                    // Do not fall back to invocation snapshots, which can place reasoning on assistant
+                    // tool-call messages before any assistant text content exists in the chain.
+                    delete clone.reasoning;
+                    if (previousAssistantReasoning) {
+                        clone.reasoning = previousAssistantReasoning;
+                    }
                 } else if (previousAssistantReasoning) {
                     // Prefer currently editable assistant-text reasoning based on forwarding mode over invocation snapshot.
                     clone.reasoning = previousAssistantReasoning;
