@@ -906,6 +906,13 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
         : tool_reasoning_modes.DISABLED;
     const includeToolReasoning = toolReasoningMode !== tool_reasoning_modes.DISABLED;
     const lastUserIdx = messages.findLastIndex(x => x.role === 'user');
+    const lastAssistantTextIdxAfterUser = toolReasoningMode === tool_reasoning_modes.ACTIVE_CHAIN
+        ? messages.findLastIndex((x, idx) => idx > lastUserIdx
+            && x?.role === 'assistant'
+            && !Array.isArray(x.invocations)
+            && typeof x.content === 'string'
+            && x.content.trim().length > 0)
+        : -1;
 
     // Insert chat messages as long as there is budget available
     const chatPool = [...messages].reverse();
@@ -959,7 +966,10 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
         if (canUseTools && Array.isArray(chatPrompt.invocations)) {
             const promptIdx = messages.indexOf(chatPrompt);
             const reasoningIsEligible = toolReasoningMode !== tool_reasoning_modes.DISABLED
-                && promptIdx > lastUserIdx;
+                && promptIdx > lastUserIdx
+                && (toolReasoningMode !== tool_reasoning_modes.ACTIVE_CHAIN
+                    || lastAssistantTextIdxAfterUser === -1
+                    || promptIdx > lastAssistantTextIdxAfterUser);
             let previousAssistantReasoning = '';
             if (reasoningIsEligible) {
                 if (toolReasoningMode === tool_reasoning_modes.ACTIVE_CHAIN) {
