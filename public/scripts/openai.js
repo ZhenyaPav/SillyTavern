@@ -253,6 +253,11 @@ export const tool_reasoning_modes = {
     ACTIVE_CHAIN: 'active_chain',
 };
 
+const interleaved_reasoning_providers = [
+    chat_completion_sources.OPENROUTER,
+    chat_completion_sources.CUSTOM,
+];
+
 export const ZAI_ENDPOINT = {
     COMMON: 'common',
     CODING: 'coding',
@@ -896,7 +901,7 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     const audioInlining = isAudioInliningSupported();
     const canUseTools = ToolManager.isToolCallingSupported();
     const includeSignature = isReasoningSignatureSupported();
-    const toolReasoningMode = supportsInterleavedReasoning(oai_settings)
+    const toolReasoningMode = interleaved_reasoning_providers.includes(oai_settings.chat_completion_source)
         ? getEffectiveToolReasoningMode()
         : tool_reasoning_modes.DISABLED;
     const includeToolReasoning = toolReasoningMode !== tool_reasoning_modes.DISABLED;
@@ -4186,7 +4191,7 @@ function setContinuePostfixControls() {
 }
 
 function setToolReasoningControls() {
-    const supportsInterleaving = supportsInterleavedReasoning(oai_settings);
+    const supportsInterleaving = interleaved_reasoning_providers.includes(oai_settings.chat_completion_source);
     const isEnabled = oai_settings.show_thoughts && supportsInterleaving;
     $('#tool_reasoning_mode').prop('disabled', !isEnabled);
     $('#interleaved_thinking_disabled_hint').toggle(!oai_settings.show_thoughts);
@@ -6054,16 +6059,6 @@ function getToolReasoningMode(settings = oai_settings) {
     return tool_reasoning_modes.DISABLED;
 }
 
-function supportsInterleavedReasoning(settings = oai_settings) {
-    switch (settings.chat_completion_source) {
-        case chat_completion_sources.OPENROUTER:
-        case chat_completion_sources.CUSTOM:
-            return true;
-        default:
-            return false;
-    }
-}
-
 /**
  * Gets the effective tool-call reasoning forwarding mode.
  * Interleaved thinking requires explicit reasoning requests.
@@ -6071,7 +6066,7 @@ function supportsInterleavedReasoning(settings = oai_settings) {
  * @returns {string} Effective reasoning forwarding mode
  */
 function getEffectiveToolReasoningMode(settings = oai_settings) {
-    if (!settings.show_thoughts || !supportsInterleavedReasoning(settings)) {
+    if (!settings.show_thoughts || !interleaved_reasoning_providers.includes(settings.chat_completion_source)) {
         return tool_reasoning_modes.DISABLED;
     }
 
