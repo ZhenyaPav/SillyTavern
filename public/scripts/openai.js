@@ -318,7 +318,6 @@ export const settingsToUpdate = {
     cometapi_model: ['#model_cometapi_select', 'cometapi_model', false, true],
     custom_model: ['#custom_model_id', 'custom_model', false, true],
     custom_url: ['#custom_api_url_text', 'custom_url', false, true],
-    custom_supports_interleaved_reasoning: ['#custom_supports_interleaved_reasoning', 'custom_supports_interleaved_reasoning', true, true],
     custom_include_body: ['#custom_include_body', 'custom_include_body', false, true],
     custom_exclude_body: ['#custom_exclude_body', 'custom_exclude_body', false, true],
     custom_include_headers: ['#custom_include_headers', 'custom_include_headers', false, true],
@@ -434,7 +433,6 @@ const default_settings = {
     azure_openai_model: '',
     custom_model: '',
     custom_url: '',
-    custom_supports_interleaved_reasoning: false,
     custom_include_body: '',
     custom_exclude_body: '',
     custom_include_headers: '',
@@ -4190,12 +4188,8 @@ function setContinuePostfixControls() {
 function setToolReasoningControls() {
     const supportsInterleaving = supportsInterleavedReasoning(oai_settings);
     const isEnabled = oai_settings.show_thoughts && supportsInterleaving;
-    const isCustomDisabled = oai_settings.show_thoughts
-        && oai_settings.chat_completion_source === chat_completion_sources.CUSTOM
-        && !supportsInterleaving;
     $('#tool_reasoning_mode').prop('disabled', !isEnabled);
     $('#interleaved_thinking_disabled_hint').toggle(!oai_settings.show_thoughts);
-    $('#custom_interleaved_thinking_disabled_hint').toggle(isCustomDisabled);
 }
 
 async function getStatusOpen() {
@@ -6063,9 +6057,8 @@ function getToolReasoningMode(settings = oai_settings) {
 function supportsInterleavedReasoning(settings = oai_settings) {
     switch (settings.chat_completion_source) {
         case chat_completion_sources.OPENROUTER:
-            return true;
         case chat_completion_sources.CUSTOM:
-            return Boolean(settings.custom_supports_interleaved_reasoning);
+            return true;
         default:
             return false;
     }
@@ -6715,12 +6708,6 @@ export function initOpenAI() {
 
     $('#custom_model_id').on('input', function () {
         oai_settings.custom_model = String($(this).val());
-        saveSettingsDebounced();
-    });
-
-    $('#custom_supports_interleaved_reasoning').on('input', function () {
-        oai_settings.custom_supports_interleaved_reasoning = !!$(this).prop('checked');
-        setToolReasoningControls();
         saveSettingsDebounced();
     });
 

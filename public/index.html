@@ -2034,11 +2034,6 @@
                                                 Enable "Request model reasoning" to use Interleaved Thinking.
                                             </em>
                                         </div>
-                                        <div id="custom_interleaved_thinking_disabled_hint" class="toggle-description justifyLeft" style="display:none;">
-                                            <em data-i18n="Enable &quot;Supports interleaved reasoning&quot; for this Custom endpoint to use Interleaved Thinking.">
-                                                Enable "Supports interleaved reasoning" for this Custom endpoint to use Interleaved Thinking.
-                                            </em>
-                                        </div>
                                     </div>
                                     <div class="range-block" data-source="openai,aimlapi,openrouter,mistralai,makersuite,vertexai,claude,custom,xai,pollinations,moonshot,cohere,cometapi,nanogpt,electronhub,azure_openai,zai,siliconflow,chutes">
                                         <label for="openai_media_inlining" class="checkbox_label flexWrap widthFreeExpand">
@@ -3821,15 +3816,6 @@
                             <h4 data-i18n="Available Models">Available Models</h4>
                             <div class="flex-container">
                                 <select id="model_custom_select" class="text_pole model_custom_select"></select>
-                            </div>
-                            <label for="custom_supports_interleaved_reasoning" class="checkbox_label marginTop10">
-                                <input id="custom_supports_interleaved_reasoning" type="checkbox" />
-                                <span data-i18n="Supports interleaved reasoning">Supports interleaved reasoning</span>
-                            </label>
-                            <div class="toggle-description justifyLeft">
-                                <span data-i18n="custom_supports_interleaved_reasoning_hint">
-                                    Reuses the standard OpenAI-compatible assistant reasoning field so Interleaved Thinking can be forwarded to compatible custom endpoints.
-                                </span>
                             </div>
                         </form>
                         <div id="xai_form" data-source="xai">
