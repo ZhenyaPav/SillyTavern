@@ -253,11 +253,6 @@ export const tool_reasoning_modes = {
     ACTIVE_CHAIN: 'active_chain',
 };
 
-// Providers that support interleaved reasoning forwarding in tool-call chains.
-const interleaved_reasoning_providers = [
-    chat_completion_sources.OPENROUTER,
-];
-
 export const ZAI_ENDPOINT = {
     COMMON: 'common',
     CODING: 'coding',
@@ -323,6 +318,7 @@ export const settingsToUpdate = {
     cometapi_model: ['#model_cometapi_select', 'cometapi_model', false, true],
     custom_model: ['#custom_model_id', 'custom_model', false, true],
     custom_url: ['#custom_api_url_text', 'custom_url', false, true],
+    custom_supports_interleaved_reasoning: ['#custom_supports_interleaved_reasoning', 'custom_supports_interleaved_reasoning', true, true],
     custom_include_body: ['#custom_include_body', 'custom_include_body', false, true],
     custom_exclude_body: ['#custom_exclude_body', 'custom_exclude_body', false, true],
     custom_include_headers: ['#custom_include_headers', 'custom_include_headers', false, true],
@@ -438,6 +434,7 @@ const default_settings = {
     azure_openai_model: '',
     custom_model: '',
     custom_url: '',
+    custom_supports_interleaved_reasoning: false,
     custom_include_body: '',
     custom_exclude_body: '',
     custom_include_headers: '',
@@ -901,8 +898,7 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     const audioInlining = isAudioInliningSupported();
     const canUseTools = ToolManager.isToolCallingSupported();
     const includeSignature = isReasoningSignatureSupported();
-    const isToolReasoningProvider = interleaved_reasoning_providers.includes(oai_settings.chat_completion_source);
-    const toolReasoningMode = isToolReasoningProvider
+    const toolReasoningMode = supportsInterleavedReasoning(oai_settings)
         ? getEffectiveToolReasoningMode()
         : tool_reasoning_modes.DISABLED;
     const includeToolReasoning = toolReasoningMode !== tool_reasoning_modes.DISABLED;
@@ -4192,9 +4188,14 @@ function setContinuePostfixControls() {
 }
 
 function setToolReasoningControls() {
-    const isEnabled = oai_settings.show_thoughts;
+    const supportsInterleaving = supportsInterleavedReasoning(oai_settings);
+    const isEnabled = oai_settings.show_thoughts && supportsInterleaving;
+    const isCustomDisabled = oai_settings.show_thoughts
+        && oai_settings.chat_completion_source === chat_completion_sources.CUSTOM
+        && !supportsInterleaving;
     $('#tool_reasoning_mode').prop('disabled', !isEnabled);
-    $('#openrouter_interleaved_thinking_disabled_hint').toggle(!isEnabled);
+    $('#interleaved_thinking_disabled_hint').toggle(!oai_settings.show_thoughts);
+    $('#custom_interleaved_thinking_disabled_hint').toggle(isCustomDisabled);
 }
 
 async function getStatusOpen() {
@@ -6059,6 +6060,17 @@ function getToolReasoningMode(settings = oai_settings) {
     return tool_reasoning_modes.DISABLED;
 }
 
+function supportsInterleavedReasoning(settings = oai_settings) {
+    switch (settings.chat_completion_source) {
+        case chat_completion_sources.OPENROUTER:
+            return true;
+        case chat_completion_sources.CUSTOM:
+            return Boolean(settings.custom_supports_interleaved_reasoning);
+        default:
+            return false;
+    }
+}
+
 /**
  * Gets the effective tool-call reasoning forwarding mode.
  * Interleaved thinking requires explicit reasoning requests.
@@ -6066,7 +6078,7 @@ function getToolReasoningMode(settings = oai_settings) {
  * @returns {string} Effective reasoning forwarding mode
  */
 function getEffectiveToolReasoningMode(settings = oai_settings) {
-    if (!settings.show_thoughts) {
+    if (!settings.show_thoughts || !supportsInterleavedReasoning(settings)) {
         return tool_reasoning_modes.DISABLED;
     }
 
@@ -6703,6 +6715,12 @@ export function initOpenAI() {
 
     $('#custom_model_id').on('input', function () {
         oai_settings.custom_model = String($(this).val());
+        saveSettingsDebounced();
+    });
+
+    $('#custom_supports_interleaved_reasoning').on('input', function () {
+        oai_settings.custom_supports_interleaved_reasoning = !!$(this).prop('checked');
+        setToolReasoningControls();
         saveSettingsDebounced();
     });
 

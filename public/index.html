@@ -2011,7 +2011,7 @@
                                             <strong data-i18n="enable_functions_desc_4">Not supported when Prompt Post-Processing with "no tools" is used!</strong>
                                         </div>
                                     </div>
-                                    <div class="range-block" data-source="openrouter">
+                                    <div class="range-block" data-source="openrouter,custom">
                                         <div class="flex-container flexFlowColumn wide100p textAlignCenter marginTop10">
                                             <div class="flex-container oneline-dropdown">
                                                 <label for="tool_reasoning_mode" data-i18n="Interleaved Thinking">
@@ -2025,13 +2025,18 @@
                                             </div>
                                         </div>
                                         <div class="toggle-description justifyLeft">
-                                            <span data-i18n="openrouter_interleaved_thinking_hint">
+                                            <span data-i18n="interleaved_thinking_hint">
                                                 Sends reasoning from preceding assistant turns with tool-call requests to maintain interleaved thinking context.
                                             </span>
                                         </div>
-                                        <div id="openrouter_interleaved_thinking_disabled_hint" class="toggle-description justifyLeft" style="display:none;">
+                                        <div id="interleaved_thinking_disabled_hint" class="toggle-description justifyLeft" style="display:none;">
                                             <em data-i18n="Enable &quot;Request model reasoning&quot; to use Interleaved Thinking.">
                                                 Enable "Request model reasoning" to use Interleaved Thinking.
+                                            </em>
+                                        </div>
+                                        <div id="custom_interleaved_thinking_disabled_hint" class="toggle-description justifyLeft" style="display:none;">
+                                            <em data-i18n="Enable &quot;Supports interleaved reasoning&quot; for this Custom endpoint to use Interleaved Thinking.">
+                                                Enable "Supports interleaved reasoning" for this Custom endpoint to use Interleaved Thinking.
                                             </em>
                                         </div>
                                     </div>
@@ -3816,6 +3821,15 @@
                             <h4 data-i18n="Available Models">Available Models</h4>
                             <div class="flex-container">
                                 <select id="model_custom_select" class="text_pole model_custom_select"></select>
+                            </div>
+                            <label for="custom_supports_interleaved_reasoning" class="checkbox_label marginTop10">
+                                <input id="custom_supports_interleaved_reasoning" type="checkbox" />
+                                <span data-i18n="Supports interleaved reasoning">Supports interleaved reasoning</span>
+                            </label>
+                            <div class="toggle-description justifyLeft">
+                                <span data-i18n="custom_supports_interleaved_reasoning_hint">
+                                    Reuses the standard OpenAI-compatible assistant reasoning field so Interleaved Thinking can be forwarded to compatible custom endpoints.
+                                </span>
                             </div>
                         </form>
                         <div id="xai_form" data-source="xai">
