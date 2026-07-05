@@ -1364,11 +1364,13 @@ export function embedOpenRouterMedia(messages, { audio = true, video = true } = 
 }
 
 /**
- * Adds a dummy reasoning_content field to messages with tool calls for DeepSeek reasoner.
+ * Adds a reasoning_content field to messages with tool calls for reasoning models.
  * @param {object[]} messages Array of messages
+ * @param {object} [options] Options
+ * @param {boolean} [options.copyReasoning=false] Copy plaintext reasoning if present
  * @returns {void}
  */
-export function addReasoningContentToToolCalls(messages) {
+export function addReasoningContentToToolCalls(messages, { copyReasoning = false } = {}) {
     if (!Array.isArray(messages)) {
         return;
     }
@@ -1378,7 +1380,9 @@ export function addReasoningContentToToolCalls(messages) {
             continue;
         }
 
-        message.reasoning_content = '';
+        message.reasoning_content = copyReasoning && typeof message.reasoning === 'string'
+            ? message.reasoning
+            : '';
     }
 }
 

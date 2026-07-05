@@ -247,6 +247,14 @@ describe('addReasoningContentToToolCalls', () => {
         expect(messages[0].reasoning_content).toBe('');
     });
 
+    test('copies reasoning to reasoning_content when requested', () => {
+        const messages = [
+            { role: 'assistant', tool_calls: [{ id: '1', function: { name: 'f' } }], reasoning: 'hidden number 73964' },
+        ];
+        mod.addReasoningContentToToolCalls(messages, { copyReasoning: true });
+        expect(messages[0].reasoning_content).toBe('hidden number 73964');
+    });
+
     test('does not overwrite existing reasoning_content', () => {
         const messages = [
             { role: 'assistant', tool_calls: [{ id: '1' }], reasoning_content: 'existing' },

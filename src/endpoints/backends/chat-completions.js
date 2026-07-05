@@ -2333,6 +2333,7 @@ router.post('/generate', async function (request, response) {
             mergeObjectWithYaml(bodyParams, request.body.custom_include_body);
             mergeObjectWithYaml(headers, request.body.custom_include_headers);
             embedOpenRouterMedia(request.body.messages, { audio: true, video: false });
+            addReasoningContentToToolCalls(request.body.messages, { copyReasoning: true });
             if (request.body.json_schema) {
                 bodyParams['response_format'] = {
                     type: 'json_schema',
