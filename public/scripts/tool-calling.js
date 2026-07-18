@@ -409,6 +409,10 @@ export class ToolManager {
             tools.push(tool.toFunctionOpenAI());
         }
 
+        // Extension initialization order can vary between page loads. Keep the
+        // serialized tool prefix stable so backends can reuse their prompt cache.
+        tools.sort((a, b) => a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0);
+
         if (tools.length) {
             console.log('[ToolManager] Registered function tools:', tools);
 
