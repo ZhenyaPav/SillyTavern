@@ -229,6 +229,7 @@ const defaultStyles = [
 ];
 
 const placeholderVae = 'Automatic';
+let autoVaeMultiSelect = false;
 
 const defaultSettings = {
     source: sources.extras,
@@ -1556,7 +1557,26 @@ async function getDrawthingsRemoteModel() {
 }
 
 async function onVaeChange() {
-    extension_settings.sd.vae = $('#sd_vae').find(':selected').val();
+    const select = $('#sd_vae');
+    let value = select.val();
+
+    if (select.prop('multiple')) {
+        const previousValue = Array.isArray(extension_settings.sd.vae)
+            ? extension_settings.sd.vae
+            : [extension_settings.sd.vae].filter(Boolean);
+        value = Array.isArray(value) ? value : [];
+
+        // "Automatic" means no per-request module override and cannot be combined with modules.
+        if (value.length > 1 && value.includes(placeholderVae)) {
+            value = previousValue.includes(placeholderVae)
+                ? value.filter(x => x !== placeholderVae)
+                : [placeholderVae];
+            select.val(value);
+        }
+    }
+
+    extension_settings.sd.vae = value;
+    saveSettingsDebounced();
 }
 
 async function getAutoRemoteUpscalers() {
@@ -2690,7 +2710,8 @@ async function loadSdcppSchedulers() {
 }
 
 async function loadVaes() {
-    $('#sd_vae').empty();
+    const select = $('#sd_vae');
+    select.empty();
     let vaes = [];
 
     switch (extension_settings.sd.source) {
@@ -2768,21 +2789,49 @@ async function loadVaes() {
             break;
     }
 
-    for (const vae of vaes) {
-        const option = document.createElement('option');
-        option.innerText = vae;
-        option.value = vae;
-        option.selected = vae === extension_settings.sd.vae;
-        $('#sd_vae').append(option);
+    const isMultiSelect = extension_settings.sd.source === sources.auto && autoVaeMultiSelect;
+    select.prop('multiple', isMultiSelect);
+    $('#sd_vae_label').text(isMultiSelect ? 'VAE / Text Encoder' : 'VAE');
+
+    const savedVaes = Array.isArray(extension_settings.sd.vae)
+        ? extension_settings.sd.vae
+        : [extension_settings.sd.vae].filter(Boolean);
+    const selectedVaes = savedVaes
+        .map(savedVae => vaes.find(vae => {
+            const name = typeof vae === 'string' ? vae : vae.name;
+            const value = typeof vae === 'string' ? vae : vae.value;
+            return savedVae === name || savedVae === value;
+        }))
+        .filter(Boolean)
+        .map(vae => typeof vae === 'string' ? vae : vae.value);
+
+    const normalizedSelection = isMultiSelect ? selectedVaes : selectedVaes[0];
+    if (selectedVaes.length > 0 && JSON.stringify(extension_settings.sd.vae) !== JSON.stringify(normalizedSelection)) {
+        extension_settings.sd.vae = normalizedSelection;
+        saveSettingsDebounced();
     }
 
-    if (!extension_settings.sd.vae && vaes.length > 0 && vaes[0] !== 'N/A') {
-        extension_settings.sd.vae = vaes[0];
-        $('#sd_vae').val(extension_settings.sd.vae).trigger('change');
+    for (const vae of vaes) {
+        const option = document.createElement('option');
+        const name = typeof vae === 'string' ? vae : vae.name;
+        const value = typeof vae === 'string' ? vae : vae.value;
+        option.innerText = name;
+        option.value = value;
+        option.selected = selectedVaes.includes(value);
+        select.append(option);
+    }
+
+    if (selectedVaes.length === 0 && vaes.length > 0) {
+        const firstVae = typeof vaes[0] === 'string' ? vaes[0] : vaes[0].value;
+        if (firstVae !== 'N/A') {
+            select.val(isMultiSelect ? [firstVae] : firstVae).trigger('change');
+        }
     }
 }
 
 async function loadAutoVaes() {
+    autoVaeMultiSelect = false;
+
     if (!extension_settings.sd.auto_url) {
         return ['N/A'];
     }
@@ -2799,8 +2848,14 @@ async function loadAutoVaes() {
         }
 
         const data = await result.json();
-        Array.isArray(data) && data.unshift(placeholderVae);
-        return data;
+        autoVaeMultiSelect = !!data?.multiple;
+
+        if (!Array.isArray(data?.items)) {
+            throw new Error('SD WebUI returned an invalid VAE/module list.');
+        }
+
+        data.items.unshift({ name: placeholderVae, value: placeholderVae });
+        return data.items;
     } catch (error) {
         return ['N/A'];
     }
@@ -3795,7 +3850,11 @@ async function generateHordeImage(prompt, negativePrompt, signal) {
  * @returns {Promise<{format: string, data: string}>} - A promise that resolves when the image generation and processing are complete.
  */
 async function generateAutoImage(prompt, negativePrompt, signal) {
-    const isValidVae = extension_settings.sd.vae && !['N/A', placeholderVae].includes(extension_settings.sd.vae);
+    const selectedVaes = (Array.isArray(extension_settings.sd.vae)
+        ? extension_settings.sd.vae
+        : [extension_settings.sd.vae])
+        .filter(x => x && !['N/A', placeholderVae].includes(x));
+    const selectedVae = selectedVaes[0];
     let payload = {
         ...getSdRequestBody(),
         prompt: prompt,
@@ -3816,8 +3875,8 @@ async function generateAutoImage(prompt, negativePrompt, signal) {
         seed: extension_settings.sd.seed >= 0 ? extension_settings.sd.seed : undefined,
         override_settings: {
             CLIP_stop_at_last_layers: extension_settings.sd.clip_skip,
-            sd_vae: isValidVae ? extension_settings.sd.vae : undefined,
-            forge_additional_modules: isValidVae ? [extension_settings.sd.vae] : undefined, // For SD Forge
+            sd_vae: selectedVae,
+            forge_additional_modules: selectedVaes.length ? selectedVaes : undefined, // For SD Forge
         },
         override_settings_restore_afterwards: true,
         clip_skip: extension_settings.sd.clip_skip, // For SD.Next
