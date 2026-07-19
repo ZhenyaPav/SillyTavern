@@ -123,14 +123,20 @@ router.post('/vaes', async (request, response) => {
             fetch(forgeUrl, requestInit).then(r => r.ok ? r.json() : Promise.reject(r.statusText)),
         ]);
 
-        const data = results.find(r => r.status === 'fulfilled')?.value;
+        const forgeResult = results[1];
+        const autoResult = results[0];
+        const isForge = forgeResult.status === 'fulfilled';
+        const data = isForge ? forgeResult.value : autoResult.status === 'fulfilled' ? autoResult.value : null;
 
         if (!Array.isArray(data)) {
             throw new Error('SD WebUI returned an error.');
         }
 
-        const names = data.map(x => x.model_name);
-        return response.send(names);
+        const items = data.map(x => ({
+            name: x.model_name,
+            value: isForge ? x.filename : x.model_name,
+        }));
+        return response.send({ items, multiple: isForge });
     } catch (error) {
         console.error(error);
         return response.sendStatus(500);
@@ -304,7 +310,9 @@ router.post('/generate', async (request, response) => {
                 const optionsData = /** @type {any} */ (await optionsResult.json());
                 const isForge = 'forge_preset' in optionsData;
 
-                if (!isForge) {
+                if (isForge) {
+                    _.unset(request.body, 'override_settings.sd_vae');
+                } else {
                     _.unset(request.body, 'override_settings.forge_additional_modules');
                 }
             }
