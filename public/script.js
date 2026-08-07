@@ -6,6 +6,7 @@ import {
     Handlebars,
     SVGInject,
     Popper,
+    localforage,
     initLibraryShims,
     default as libs,
     lodash,
@@ -111,6 +112,10 @@ import {
     loadProxyPresets,
     selected_proxy,
     initOpenAI,
+    claimDurableRun,
+    commitDurableRun,
+    cancelDurableRun,
+    waitForDurableRunCommit,
 } from './scripts/openai.js';
 
 import {
@@ -452,6 +457,38 @@ let dialogueResolve = null;
 let dialogueCloseStop = false;
 /** @type {ChatMetadata} */
 export let chat_metadata = {};
+export let chatRevision = '0';
+
+const chatConflictStorage = localforage.createInstance({ name: 'SillyTavern_Chat_Conflicts' });
+
+export class ChatSaveConflictError extends Error {
+    constructor() {
+        super('Chat changed in another tab');
+        this.name = 'ChatSaveConflictError';
+    }
+}
+
+export function setChatRevision(value) {
+    chatRevision = value || '0';
+}
+
+export async function handleChatSaveConflict(chatKey, attemptedChat, currentRevision) {
+    const snapshotKey = `${Date.now()}_${chatKey}`;
+    await chatConflictStorage.setItem(snapshotKey, {
+        chatKey,
+        attemptedChat,
+        baseRevision: chatRevision,
+        currentRevision,
+        savedAt: new Date().toISOString(),
+    });
+    await Popup.show.confirm(
+        t`This chat changed in another tab. Your newer server copy was not overwritten.`,
+        t`A recovery snapshot of this tab was saved locally. Reload the authoritative chat before making more changes.`,
+        { okButton: t`Reload chat`, cancelButton: false },
+    );
+    await reloadCurrentChat();
+    throw new ChatSaveConflictError();
+}
 /** @type {StreamingProcessor} */
 export let streamingProcessor = null;
 let crop_data = undefined;
@@ -689,6 +726,44 @@ export async function pingServer() {
     }
 }
 
+const presenceClientId = sessionStorage.getItem('sillytavern_presence_client_id') || uuidv4();
+sessionStorage.setItem('sillytavern_presence_client_id', presenceClientId);
+let presenceConnectedOnce = false;
+
+async function connectClientPresence(reason = 'initial') {
+    try {
+        const response = await fetch('/api/clients/connect', {
+            method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ client_id: presenceClientId }),
+        });
+        if (!response.ok) return;
+        const presence = await response.json();
+        presenceConnectedOnce = true;
+        await eventSource.emit(event_types.CLIENT_CONNECTED, { ...presence, reason });
+    } catch (error) {
+        console.debug('Client presence connection failed', error);
+    }
+}
+
+function initClientPresence() {
+    setInterval(async () => {
+        try {
+            const response = await fetch('/api/clients/heartbeat', {
+                method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ client_id: presenceClientId }),
+            });
+            if (!response.ok) await connectClientPresence('network_reconnect');
+        } catch {
+            // The next heartbeat or browser online event will reconnect.
+        }
+    }, 30_000);
+    window.addEventListener('online', () => void connectClientPresence(presenceConnectedOnce ? 'network_reconnect' : 'initial'));
+    window.addEventListener('pageshow', event => event.persisted && void connectClientPresence('pageshow'));
+    window.addEventListener('pagehide', () => {
+        void fetch('/api/clients/disconnect', {
+            method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ client_id: presenceClientId }), keepalive: true,
+        });
+    });
+}
+
 //MARK: firstLoadInit
 async function firstLoadInit() {
     try {
@@ -739,6 +814,7 @@ async function firstLoadInit() {
     initDefaultSlashCommands();
     initTextGenModels();
     initOpenAI();
+    initClientPresence();
     initTextGenSettings();
     initKoboldSettings();
     initNovelAISettings();
@@ -783,6 +859,7 @@ async function firstLoadInit() {
     initSwipePicker();
     addDebugFunctions();
     doDailyExtensionUpdatesCheck();
+    await connectClientPresence('initial');
     await eventSource.emit(event_types.APP_INITIALIZED);
     await initLoaderHandle.hide();
     await fixViewport();
@@ -3557,6 +3634,8 @@ class StreamingProcessor {
         this.images = [];
         /** @type {string?} */
         this.reasoningSignature = null;
+        /** @type {string|null} */
+        this.durableRunId = null;
     }
 
     /**
@@ -5365,6 +5444,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
             }
 
             streamingProcessor.generator = await sendStreamingRequest(type, generate_data, { jsonSchema });
+            streamingProcessor.durableRunId = streamingProcessor.generator?.durableRunId ?? null;
 
             hideSwipeButtons();
             let getMessage = await streamingProcessor.generate();
@@ -5381,6 +5461,18 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
             const isStreamFinished = streamingProcessor && !streamingProcessor.isStopped && streamingProcessor.isFinished;
             const isStreamWithToolCalls = streamingProcessor && Array.isArray(streamingProcessor.toolCalls) && streamingProcessor.toolCalls.length;
+            if (isStreamFinished && streamingProcessor.durableRunId) {
+                const claimed = await claimDurableRun(streamingProcessor.durableRunId);
+                if (!claimed) {
+                    const committed = await waitForDurableRunCommit(streamingProcessor.durableRunId);
+                    if (committed || !await claimDurableRun(streamingProcessor.durableRunId)) {
+                        await reloadCurrentChat();
+                        unblockGeneration(type);
+                        streamingProcessor = null;
+                        return;
+                    }
+                }
+            }
             if (canPerformToolCalls && isStreamFinished && isStreamWithToolCalls) {
                 const lastMessage = chat[chat.length - 1];
                 const hasToolCalls = ToolManager.hasToolCalls(streamingProcessor.toolCalls);
@@ -5399,19 +5491,30 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                             ToolManager.showToolCallError(invocationResult.errors);
                         }
                         unblockGeneration(type);
+                        await commitDurableRun(streamingProcessor?.durableRunId);
                         streamingProcessor = null;
                         return;
                     }
 
+                    const durableRunId = streamingProcessor?.durableRunId;
                     streamingProcessor = null;
                     depth = depth + 1;
                     await ToolManager.saveFunctionToolInvocations(invocationResult.invocations);
+                    await commitDurableRun(durableRunId);
                     return Generate('normal', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth }, dryRun);
                 }
             }
 
             if (isStreamFinished) {
+                const durableRunId = streamingProcessor.durableRunId;
+                if (durableRunId && streamingProcessor.messageId >= 0) {
+                    chat[streamingProcessor.messageId].extra ??= {};
+                    chat[streamingProcessor.messageId].extra.durable_run_id = durableRunId;
+                }
                 await streamingProcessor.onFinishStreaming(streamingProcessor.messageId, getMessage);
+                const committedLocally = !durableRunId || chat.some(message => message?.extra?.durable_run_id === durableRunId
+                    || message?.swipe_info?.some(info => info?.extra?.durable_run_id === durableRunId));
+                if (committedLocally) await commitDurableRun(durableRunId);
                 streamingProcessor = null;
                 triggerAutoContinue(messageChunk, isImpersonate);
                 return Object.defineProperties(new String(getMessage), {
@@ -5581,6 +5684,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 export function stopGeneration() {
     let stopped = false;
     if (streamingProcessor) {
+        void cancelDurableRun(streamingProcessor.durableRunId);
         streamingProcessor.onStopStreaming();
         stopped = true;
     }
@@ -5856,6 +5960,7 @@ export async function sendMessageAsUser(messageText, messageBias, insertAt = nul
         mes: substituteParams(messageText),
         extra: {
             isSmallSys: compact,
+            message_id: uuidv4(),
         },
     };
 
@@ -6717,6 +6822,7 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         const newMessage = {};
         chat.push(newMessage);
         newMessage.extra = {};
+        newMessage.extra.message_id = uuidv4();
         newMessage.name = name2;
         newMessage.is_user = false;
         newMessage.send_date = getMessageTimeStamp();
@@ -7416,15 +7522,22 @@ export async function saveChat({ chatName, withMetadata, mesId, force = false, c
                 chat: [chatHeader, ...trimmedChat],
                 avatar_url: characters[this_chid].avatar,
                 force: force,
+                base_revision: chatRevision,
             }),
         });
         const result = await fetch('/api/chats/save', saveChatRequest);
 
         if (result.ok) {
+            const data = await result.json();
+            setChatRevision(data.revision);
             return;
         }
 
         const errorData = await result.json();
+        if (result.status === 409 && errorData?.error === 'conflict') {
+            await handleChatSaveConflict(fileName, [chatHeader, ...trimmedChat], errorData.current_revision);
+            return;
+        }
         const isIntegrityError = errorData?.error === 'integrity' && !force;
         if (!isIntegrityError) {
             throw new Error(result.statusText);
@@ -7448,6 +7561,7 @@ export async function saveChat({ chatName, withMetadata, mesId, force = false, c
 
         await saveChat({ chatName, withMetadata, mesId, force: true });
     } catch (error) {
+        if (error instanceof ChatSaveConflictError) throw error;
         console.error(error);
         toastr.error(t`Check the server connection and reload the page to prevent data loss.`, t`Chat could not be saved`);
     }
@@ -7623,6 +7737,8 @@ export async function getChat() {
         if (!response.ok) {
             throw new Error('Chat could not be loaded');
         }
+
+        setChatRevision(response.headers.get('X-Chat-Revision'));
 
         const data = await response.json();
         if (Array.isArray(data) && data.length > 0) {
@@ -9405,6 +9521,7 @@ export async function saveChatConditional() {
         saveTokenCache();
         saveItemizedPrompts(getCurrentChatId());
     } catch (error) {
+        if (error instanceof ChatSaveConflictError) throw error;
         console.error('Error saving chat', error);
     } finally {
         isChatSaving = false;
@@ -9942,6 +10059,8 @@ export async function swipe(event, direction, { source, repeated, message = chat
     }
 
     const mesId = Number(forceMesId ?? event?.currentTarget?.closest('.mes')?.getAttribute('mesid') ?? messageIndex ?? chat.length - 1);
+    chat[mesId].extra ??= {};
+    chat[mesId].extra.message_id ??= uuidv4();
 
     if ([SWIPE_SOURCE.DELETE, SWIPE_SOURCE.BACK, SWIPE_SOURCE.AUTO_SWIPE, SWIPE_SOURCE.SLASH_COMMAND, SWIPE_SOURCE.SWIPE_PICKER].includes(source)) {
         console.info(`The ${direction} swipe source on message #${mesId} is ${source}, Most checks have been bypassed. `);

@@ -42,6 +42,8 @@ import { router as searchRouter } from './endpoints/search.js';
 import { router as openRouterRouter } from './endpoints/openrouter.js';
 import { router as nanogptRouter } from './endpoints/nanogpt.js';
 import { router as chatCompletionsRouter } from './endpoints/backends/chat-completions.js';
+import { router as durableRunsRouter } from './endpoints/backends/durable-runs.js';
+import { router as clientPresenceRouter } from './endpoints/client-presence.js';
 import { router as koboldRouter } from './endpoints/backends/kobold.js';
 import { router as textCompletionsRouter } from './endpoints/backends/text-completions.js';
 import { router as speechRouter } from './endpoints/speech.js';
@@ -140,6 +142,7 @@ export function redirectDeprecatedEndpoints(app) {
 export function setupPrivateEndpoints(app) {
     app.use('/', userDataRouter);
     app.use('/api/users', usersPrivateRouter);
+    app.use('/api/clients', clientPresenceRouter);
     app.use('/api/users', usersAdminRouter);
     app.use('/api/moving-ui', movingUIRouter);
     app.use('/api/images', imagesRouter);
@@ -177,6 +180,7 @@ export function setupPrivateEndpoints(app) {
     app.use('/api/openrouter', openRouterRouter);
     app.use('/api/nanogpt', nanogptRouter);
     app.use('/api/backends/kobold', koboldRouter);
+    app.use('/api/backends/chat-completions/runs', durableRunsRouter);
     app.use('/api/backends/chat-completions', chatCompletionsRouter);
     app.use('/api/speech', speechRouter);
     app.use('/api/azure', azureRouter);

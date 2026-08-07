@@ -9,6 +9,8 @@ import {
     abortStatusCheck,
     cancelStatusCheck,
     characters,
+    chat,
+    cleanUpMessage,
     event_types,
     eventSource,
     extension_prompt_roles,
@@ -24,6 +26,9 @@ import {
     name1,
     name2,
     resultCheckStatus,
+    reloadCurrentChat,
+    saveChatConditional,
+    saveReply,
     saveSettingsDebounced,
     setOnlineStatus,
     startStatusLoading,
@@ -81,6 +86,7 @@ import { ToolManager } from './tool-calling.js';
 import { accountStorage } from './util/AccountStorage.js';
 import { COMETAPI_IGNORE_PATTERNS, IGNORE_SYMBOL, MEDIA_DISPLAY, MEDIA_TYPE } from './constants.js';
 import { syncNanoGptProvidersForModel, syncOpenRouterProvidersForModel, updateNanoGptProvidersWarning, updateOpenRouterProvidersWarning } from './textgen-models.js';
+import { StreamingDisplay } from './streaming-display.js';
 
 export {
     openai_messages_count,
@@ -97,6 +103,183 @@ export {
 };
 
 let openai_messages_count = 0;
+const DURABLE_RUNS_URL = '/api/backends/chat-completions/runs';
+const durableClientId = sessionStorage.getItem('durable_generation_client_id') || uuidv4();
+sessionStorage.setItem('durable_generation_client_id', durableClientId);
+const attachedDurableRuns = new Set();
+
+function getDurableChatKey() {
+    if (selected_group || this_chid === undefined) return null;
+    const character = characters[this_chid];
+    return character?.avatar && character?.chat ? `${character.avatar}::${character.chat}` : null;
+}
+
+async function createDurableRun(type, generateData) {
+    const chatKey = getDurableChatKey();
+    if (!oai_settings.durable_generation || !chatKey || !['normal', 'swipe'].includes(type) || oai_settings.chat_completion_source !== chat_completion_sources.CUSTOM || !generateData.stream) return null;
+    const anchorMessageId = chat.at(-1)?.extra?.message_id ?? null;
+    const context = {
+        character_avatar: characters[this_chid].avatar,
+        chat_id: characters[this_chid].chat,
+        ...(type === 'swipe' ? { target_message_id: anchorMessageId } : { parent_message_id: anchorMessageId }),
+    };
+    const response = await fetch(DURABLE_RUNS_URL, {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            chat_key: chatKey,
+            operation: type,
+            client_id: durableClientId,
+            context,
+            generation_data: generateData,
+        }),
+    });
+    if (![202, 409].includes(response.status)) throw new Error(`Could not create durable run: ${response.status} ${await response.text()}`);
+    const run = await response.json();
+    const anchorKey = type === 'swipe' ? 'target_message_id' : 'parent_message_id';
+    if (response.status === 409 && run.context?.[anchorKey] !== context[anchorKey]) {
+        throw new Error('Another generation is already active for a different version of this chat.');
+    }
+    attachedDurableRuns.add(run.id);
+    return run;
+}
+
+export async function claimDurableRun(runId) {
+    if (!runId) return true;
+    const response = await fetch(`${DURABLE_RUNS_URL}/${encodeURIComponent(runId)}/claim`, {
+        method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ client_id: durableClientId }),
+    });
+    return response.ok;
+}
+
+export async function commitDurableRun(runId) {
+    if (!runId) return;
+    await fetch(`${DURABLE_RUNS_URL}/${encodeURIComponent(runId)}/commit`, {
+        method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ client_id: durableClientId }),
+    });
+    attachedDurableRuns.delete(runId);
+}
+
+export async function cancelDurableRun(runId) {
+    if (!runId) return;
+    await fetch(`${DURABLE_RUNS_URL}/${encodeURIComponent(runId)}/cancel`, { method: 'POST', headers: getRequestHeaders() });
+}
+
+export async function waitForDurableRunCommit(runId, timeout = 35_000) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+        const response = await fetch(`${DURABLE_RUNS_URL}/${encodeURIComponent(runId)}`, { headers: getRequestHeaders() });
+        if (response.ok && (await response.json()).commitStatus === 'committed') return true;
+        await delay(500);
+    }
+    return false;
+}
+
+async function waitForDurableRunCompletion(runId, timeout = 10_000) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+        const response = await fetch(`${DURABLE_RUNS_URL}/${encodeURIComponent(runId)}`, { headers: getRequestHeaders() });
+        if (response.ok) {
+            const run = await response.json();
+            if (['completed', 'failed', 'cancelled'].includes(run.status)) return run;
+        }
+        await delay(100);
+    }
+    return null;
+}
+
+async function recoverDurableRun(run) {
+    if (attachedDurableRuns.has(run.id) || run.commitStatus === 'committed') return;
+    attachedDurableRuns.add(run.id);
+    const display = new StreamingDisplay().show({
+        label: t`Following generation from another tab`,
+        onStop: () => cancelDurableRun(run.id),
+    });
+    try {
+        const response = await fetch(`${DURABLE_RUNS_URL}/${encodeURIComponent(run.id)}/stream`, { headers: getRequestHeaders() });
+        if (!response.ok) throw new Error(`Could not resume durable run: ${response.status}`);
+        const eventStream = getEventSourceStream();
+        response.body.pipeThrough(eventStream);
+        const reader = eventStream.readable.getReader();
+        const state = { reasoning: '', images: [], signature: '', toolSignatures: {} };
+        const toolCalls = [];
+        let text = '';
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done || value.data === '[DONE]') break;
+            const parsed = JSON.parse(value.data);
+            text += getStreamingReply(parsed, state);
+            ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
+            display.updateReasoning(state.reasoning).updateContent(text);
+        }
+        const status = await waitForDurableRunCompletion(run.id);
+        if (status?.status !== 'completed') throw new Error(status?.error || 'Durable generation did not complete.');
+        await reloadCurrentChat();
+        const alreadyCommitted = chat.some(message => message?.extra?.durable_run_id === run.id
+            || message?.swipe_info?.some(info => info?.extra?.durable_run_id === run.id));
+        const anchorKey = run.operation === 'swipe' ? 'target_message_id' : 'parent_message_id';
+        const expectedAnchor = run.context?.[anchorKey];
+        const currentAnchor = chat.at(-1)?.extra?.message_id ?? null;
+        if (!alreadyCommitted && expectedAnchor !== currentAnchor) {
+            throw new Error('The chat advanced after this run started; automatic recovery was left pending to avoid attaching the reply to the wrong message.');
+        }
+        if (!await claimDurableRun(run.id)) {
+            const committed = await waitForDurableRunCommit(run.id);
+            if (committed || !await claimDurableRun(run.id)) {
+                await reloadCurrentChat();
+                display.complete({ label: t`Generation synchronized` });
+                return;
+            }
+        }
+        if (!alreadyCommitted) {
+            text = cleanUpMessage({ getMessage: text, isImpersonate: false, isContinue: false, displayIncompleteSentences: false });
+            await saveReply({
+                type: run.operation,
+                getMessage: text,
+                reasoning: state.reasoning,
+                reasoningSignature: state.signature,
+                imageUrls: state.images,
+            });
+            const message = chat.at(-1);
+            message.extra ??= {};
+            message.extra.durable_run_id = run.id;
+            if (message.swipe_id !== undefined && message.swipe_info?.[message.swipe_id]?.extra) {
+                message.swipe_info[message.swipe_id].extra.durable_run_id = run.id;
+            }
+            await saveChatConditional();
+
+            if (ToolManager.hasToolCalls(toolCalls)) {
+                const invocationResult = await ToolManager.invokeFunctionTools(toolCalls, { reasoningText: state.reasoning });
+                if (invocationResult.errors?.length) ToolManager.showToolCallError(invocationResult.errors);
+                await ToolManager.saveFunctionToolInvocations(invocationResult.invocations);
+                await commitDurableRun(run.id);
+                display.complete({ label: t`Generation recovered; continuing after tool call` });
+                if (invocationResult.invocations.length && !invocationResult.stealthCalls.length) void Generate('normal', { depth: 1 });
+                return;
+            }
+        }
+        const committedLocally = chat.some(message => message?.extra?.durable_run_id === run.id
+            || message?.swipe_info?.some(info => info?.extra?.durable_run_id === run.id));
+        if (committedLocally) await commitDurableRun(run.id);
+        display.complete({ label: t`Generation recovered` });
+    } catch (error) {
+        console.error('[Durable generation] Recovery failed', error);
+        display.complete({ label: t`Generation recovery failed` });
+    } finally {
+        attachedDurableRuns.delete(run.id);
+    }
+}
+
+export async function discoverDurableRuns() {
+    const chatKey = getDurableChatKey();
+    if (!chatKey) return;
+    const response = await fetch(`${DURABLE_RUNS_URL}?chat_key=${encodeURIComponent(chatKey)}`, { headers: getRequestHeaders() });
+    if (!response.ok) return;
+    const runs = await response.json();
+    for (const run of runs.filter(run => ['running', 'completed'].includes(run.status) && run.commitStatus !== 'committed')) {
+        void recoverDurableRun(run);
+    }
+}
 
 const default_main_prompt = 'Write {{char}}\'s next reply in a fictional chat between {{charIfNotGroup}} and {{user}}.';
 const default_nsfw_prompt = '';
@@ -373,6 +556,7 @@ export const settingsToUpdate = {
     personality_format: ['#personality_format_textarea', 'personality_format', false, false],
     group_nudge_prompt: ['#group_nudge_prompt_textarea', 'group_nudge_prompt', false, false],
     stream_openai: ['#stream_toggle', 'stream_openai', true, false],
+    durable_generation: ['#durable_generation_toggle', 'durable_generation', true, false],
     prompts: ['', 'prompts', false, false],
     prompt_order: ['', 'prompt_order', false, false],
     show_external_models: ['#openai_show_external_models', 'show_external_models', true, true],
@@ -418,6 +602,7 @@ const default_settings = {
     top_a_openai: 0,
     repetition_penalty_openai: 1,
     stream_openai: false,
+    durable_generation: false,
     openai_max_context: max_4k,
     openai_max_tokens: 300,
     ...chatCompletionDefaultPrompts,
@@ -3085,12 +3270,14 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
     const { generate_data, stream, canMultiSwipe } = await createGenerationParameters(oai_settings, model, type, messages, { jsonSchema });
     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
 
-    const generate_url = '/api/backends/chat-completions/generate';
-    const response = await fetch(generate_url, {
-        method: 'POST',
-        body: JSON.stringify(generate_data),
-        headers: getRequestHeaders(),
-        signal: signal,
+    const durableRun = stream ? await createDurableRun(type, generate_data) : null;
+    const generate_url = durableRun
+        ? `${DURABLE_RUNS_URL}/${encodeURIComponent(durableRun.id)}/stream`
+        : '/api/backends/chat-completions/generate';
+    const response = await fetch(generate_url, durableRun ? {
+        method: 'GET', headers: getRequestHeaders(), signal: signal,
+    } : {
+        method: 'POST', body: JSON.stringify(generate_data), headers: getRequestHeaders(), signal: signal,
     });
 
     if (!response.ok) {
@@ -3101,32 +3288,38 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
         const eventStream = getEventSourceStream();
         response.body.pipeThrough(eventStream);
         const reader = eventStream.readable.getReader();
-        return async function* streamData() {
+        const streamData = async function* streamData() {
             let text = '';
             const swipes = [];
             const toolCalls = [];
             const state = { reasoning: '', images: [], signature: '', toolSignatures: {} };
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) return;
-                const rawData = value.data;
-                if (rawData === '[DONE]') return;
-                tryParseStreamingError(response, rawData);
-                const parsed = JSON.parse(rawData);
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) return;
+                    const rawData = value.data;
+                    if (rawData === '[DONE]') return;
+                    tryParseStreamingError(response, rawData);
+                    const parsed = JSON.parse(rawData);
 
-                if (canMultiSwipe && Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
-                    const swipeIndex = parsed.choices[0].index - 1;
-                    // FIXME: state.reasoning should be an array to support multi-swipe
-                    swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
-                } else {
-                    text += getStreamingReply(parsed, state);
+                    if (canMultiSwipe && Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
+                        const swipeIndex = parsed.choices[0].index - 1;
+                        // FIXME: state.reasoning should be an array to support multi-swipe
+                        swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
+                    } else {
+                        text += getStreamingReply(parsed, state);
+                    }
+
+                    ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
+
+                    yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
                 }
-
-                ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
-
-                yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
+            } finally {
+                if (durableRun?.id) attachedDurableRuns.delete(durableRun.id);
             }
         };
+        streamData.durableRunId = durableRun?.id ?? null;
+        return streamData;
     } else {
         const data = await response.json();
 
@@ -6670,6 +6863,9 @@ function updateFeatureSupportFlags() {
 }
 
 export function initOpenAI() {
+    eventSource.on(event_types.APP_READY, discoverDurableRuns);
+    eventSource.on(event_types.CHAT_CHANGED, discoverDurableRuns);
+    eventSource.on(event_types.CLIENT_CONNECTED, discoverDurableRuns);
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'proxy',
         callback: runProxyCallback,
@@ -6755,6 +6951,11 @@ export function initOpenAI() {
 
     $('#stream_toggle').on('change', function () {
         oai_settings.stream_openai = !!$('#stream_toggle').prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#durable_generation_toggle').on('change', function () {
+        oai_settings.durable_generation = !!$('#durable_generation_toggle').prop('checked');
         saveSettingsDebounced();
     });
 

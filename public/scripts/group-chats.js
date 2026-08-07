@@ -79,6 +79,9 @@ import {
     unshallowCharacter,
     chatElement,
     ensureMessageMediaIsArray,
+    chatRevision,
+    setChatRevision,
+    handleChatSaveConflict,
 } from '../script.js';
 import { printTagList, createTagMapFromList, applyTagsOnCharacterSelect, tag_map, applyTagsOnGroupSelect, printTagFilters, tag_filter_type } from './tags.js';
 import { FILTER_TYPES, FilterHelper } from './filters.js';
@@ -200,6 +203,7 @@ async function loadGroupChat(chatId) {
     });
 
     if (response.ok) {
+        setChatRevision(response.headers.get('X-Chat-Revision'));
         const data = await response.json();
         if (!Array.isArray(data)) {
             return [];
@@ -637,12 +641,19 @@ async function saveGroupChat(groupId, shouldSaveGroup, force = false) {
     const saveGroupChatRequest = await compressRequest({
         method: 'POST',
         headers: getRequestHeaders(),
-        body: JSON.stringify({ id: chatId, chat: [chatHeader, ...chat], force: force }),
+        body: JSON.stringify({ id: chatId, chat: [chatHeader, ...chat], force: force, base_revision: chatRevision }),
     });
     const response = await fetch('/api/chats/group/save', saveGroupChatRequest);
 
-    if (!response.ok) {
+    if (response.ok) {
+        const data = await response.json();
+        setChatRevision(data.revision);
+    } else {
         const errorData = await response.json();
+        if (response.status === 409 && errorData?.error === 'conflict') {
+            await handleChatSaveConflict(chatId, [chatHeader, ...chat], errorData.current_revision);
+            return;
+        }
         const isIntegrityError = errorData?.error === 'integrity' && !force;
         if (!isIntegrityError) {
             toastr.error(t`Check the server connection and reload the page to prevent data loss.`, t`Group Chat could not be saved`);
