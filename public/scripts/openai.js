@@ -7,6 +7,7 @@ import { Fuse, DOMPurify } from '../lib.js';
 
 import {
     abortStatusCheck,
+    addOneMessage,
     cancelStatusCheck,
     characters,
     chat,
@@ -36,6 +37,7 @@ import {
     substituteParamsExtended,
     system_message_types,
     this_chid,
+    updateMessageBlock,
 } from '../script.js';
 import { getGroupNames, selected_group } from './group-chats.js';
 
@@ -107,6 +109,7 @@ const DURABLE_RUNS_URL = '/api/backends/chat-completions/runs';
 const durableClientId = sessionStorage.getItem('durable_generation_client_id') || uuidv4();
 sessionStorage.setItem('durable_generation_client_id', durableClientId);
 const attachedDurableRuns = new Set();
+let durableDiscoveryPending = false;
 
 function getDurableChatKey() {
     if (selected_group || this_chid === undefined) return null;
@@ -196,6 +199,37 @@ async function recoverDurableRun(run) {
         onStop: () => cancelDurableRun(run.id),
     });
     try {
+        await reloadCurrentChat();
+        const anchorKey = run.operation === 'swipe' ? 'target_message_id' : 'parent_message_id';
+        const expectedAnchor = run.context?.[anchorKey];
+        const currentAnchor = chat.at(-1)?.extra?.message_id ?? null;
+        if (expectedAnchor !== currentAnchor) {
+            throw new Error('The chat advanced after this run started; automatic recovery was left pending to avoid attaching the reply to the wrong message.');
+        }
+
+        let previewMessage;
+        let previewMessageId;
+        if (run.operation === 'swipe') {
+            previewMessage = chat.at(-1);
+            previewMessageId = chat.length - 1;
+            previewMessage.mes = '...';
+            previewMessage.extra ??= {};
+            previewMessage.extra.reasoning = '';
+            addOneMessage(previewMessage, { type: 'swipe', forceId: previewMessageId, showSwipes: false });
+        } else {
+            previewMessage = {
+                name: name2,
+                is_user: false,
+                is_system: false,
+                send_date: new Date().toISOString(),
+                mes: '...',
+                extra: { reasoning: '', durable_preview_run_id: run.id },
+            };
+            chat.push(previewMessage);
+            previewMessageId = chat.length - 1;
+            addOneMessage(previewMessage);
+        }
+
         const response = await fetch(`${DURABLE_RUNS_URL}/${encodeURIComponent(run.id)}/stream`, { headers: getRequestHeaders() });
         if (!response.ok) throw new Error(`Could not resume durable run: ${response.status}`);
         const eventStream = getEventSourceStream();
@@ -211,16 +245,17 @@ async function recoverDurableRun(run) {
             text += getStreamingReply(parsed, state);
             ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
             display.updateReasoning(state.reasoning).updateContent(text);
+            if (getDurableChatKey() !== run.chatKey) throw new Error('Chat changed while following a durable run.');
+            previewMessage.mes = text || '...';
+            previewMessage.extra.reasoning = state.reasoning;
+            updateMessageBlock(previewMessageId, previewMessage);
         }
         const status = await waitForDurableRunCompletion(run.id);
         if (status?.status !== 'completed') throw new Error(status?.error || 'Durable generation did not complete.');
         await reloadCurrentChat();
         const alreadyCommitted = chat.some(message => message?.extra?.durable_run_id === run.id
             || message?.swipe_info?.some(info => info?.extra?.durable_run_id === run.id));
-        const anchorKey = run.operation === 'swipe' ? 'target_message_id' : 'parent_message_id';
-        const expectedAnchor = run.context?.[anchorKey];
-        const currentAnchor = chat.at(-1)?.extra?.message_id ?? null;
-        if (!alreadyCommitted && expectedAnchor !== currentAnchor) {
+        if (!alreadyCommitted && expectedAnchor !== (chat.at(-1)?.extra?.message_id ?? null)) {
             throw new Error('The chat advanced after this run started; automatic recovery was left pending to avoid attaching the reply to the wrong message.');
         }
         if (!await claimDurableRun(run.id)) {
@@ -265,19 +300,34 @@ async function recoverDurableRun(run) {
     } catch (error) {
         console.error('[Durable generation] Recovery failed', error);
         display.complete({ label: t`Generation recovery failed` });
+        if (getDurableChatKey() === run.chatKey) {
+            try {
+                await reloadCurrentChat();
+            } catch (reloadError) {
+                console.debug('[Durable generation] Could not clear the recovery preview', reloadError);
+            }
+        }
     } finally {
         attachedDurableRuns.delete(run.id);
     }
 }
 
 export async function discoverDurableRuns() {
+    if (durableDiscoveryPending || !oai_settings.durable_generation) return;
     const chatKey = getDurableChatKey();
     if (!chatKey) return;
-    const response = await fetch(`${DURABLE_RUNS_URL}?chat_key=${encodeURIComponent(chatKey)}`, { headers: getRequestHeaders() });
-    if (!response.ok) return;
-    const runs = await response.json();
-    for (const run of runs.filter(run => ['running', 'completed'].includes(run.status) && run.commitStatus !== 'committed')) {
-        void recoverDurableRun(run);
+    durableDiscoveryPending = true;
+    try {
+        const response = await fetch(`${DURABLE_RUNS_URL}?chat_key=${encodeURIComponent(chatKey)}`, { headers: getRequestHeaders() });
+        if (!response.ok) return;
+        const runs = await response.json();
+        for (const run of runs.filter(run => ['reserved', 'running', 'completed'].includes(run.status) && run.commitStatus !== 'committed')) {
+            void recoverDurableRun(run);
+        }
+    } catch (error) {
+        console.debug('[Durable generation] Run discovery failed', error);
+    } finally {
+        durableDiscoveryPending = false;
     }
 }
 
@@ -3314,8 +3364,9 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
 
                     yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
                 }
-            } finally {
+            } catch (error) {
                 if (durableRun?.id) attachedDurableRuns.delete(durableRun.id);
+                throw error;
             }
         };
         streamData.durableRunId = durableRun?.id ?? null;
@@ -6866,6 +6917,7 @@ export function initOpenAI() {
     eventSource.on(event_types.APP_READY, discoverDurableRuns);
     eventSource.on(event_types.CHAT_CHANGED, discoverDurableRuns);
     eventSource.on(event_types.CLIENT_CONNECTED, discoverDurableRuns);
+    setInterval(() => void discoverDurableRuns(), 2_500);
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'proxy',
         callback: runProxyCallback,
