@@ -7,12 +7,18 @@ import { power_user, registerDebugFunction } from './power-user.js';
 import { isMobile } from './RossAscends-mods.js';
 import { renderTemplateAsync } from './templates.js';
 import { getFriendlyTokenizerName, getTokenCountAsync } from './tokenizers.js';
-import { copyText } from './utils.js';
+import { copyText, uuidv4 } from './utils.js';
+import { PromptStore } from './prompt-store.js';
 
-let PromptArrayItemForRawPromptDisplay;
-let priorPromptArrayItemForRawPromptDisplay;
-
-const promptStorage = localforage.createInstance({ name: 'SillyTavern_Prompts' });
+const promptStorage = new PromptStore(
+    localforage.createInstance({ name: 'SillyTavern_Prompts' }),
+    localforage.createInstance({ name: 'SillyTavern_PromptRecords' }),
+    uuidv4,
+);
+let pendingSave = Promise.resolve();
+let loadVersion = 0;
+// Saved entries contain only mesId, promptKey, and hasRawPrompt. Full bodies are
+// kept here only until saved; inspection loads the requested bodies separately.
 export let itemizedPrompts = [];
 
 /**
@@ -20,22 +26,25 @@ export let itemizedPrompts = [];
  * @param {string} chatId Chat ID to load
  */
 export async function loadItemizedPrompts(chatId) {
+    const version = ++loadVersion;
     try {
+        await pendingSave;
+        if (version !== loadVersion) return;
         if (!chatId) {
             itemizedPrompts = [];
             return;
         }
 
-        itemizedPrompts = await promptStorage.getItem(chatId);
-
-        if (!itemizedPrompts) {
-            itemizedPrompts = [];
+        const prompts = await promptStorage.load(chatId);
+        if (version !== loadVersion) {
+            return;
         }
+        itemizedPrompts = prompts;
 
         await eventSource.emit(event_types.ITEMIZED_PROMPTS_LOADED, { chatId: chatId });
     } catch {
         console.log('Error loading itemized prompts for chat', chatId);
-        itemizedPrompts = [];
+        if (version === loadVersion) itemizedPrompts = [];
     }
 }
 
@@ -44,12 +53,27 @@ export async function loadItemizedPrompts(chatId) {
  * @param {string} chatId Chat ID to save itemized prompts for
  */
 export async function saveItemizedPrompts(chatId) {
-    try {
-        if (!chatId) {
-            return;
+    if (!chatId) {
+        return;
+    }
+    const prompts = itemizedPrompts;
+    // Serialize saves before taking snapshots as well as before writing. A
+    // second save must see the summaries produced by the first one.
+    const save = pendingSave.then(async () => {
+        const sources = prompts.slice();
+        const summaries = await promptStorage.save(chatId, sources);
+        const saved = new Map(sources.map((source, i) => [source, summaries[i]]));
+        for (let i = 0; i < prompts.length; i++) {
+            const summary = saved.get(prompts[i]);
+            if (summary && prompts[i].mesId === summary.mesId) {
+                prompts[i] = summary;
+            }
         }
-
-        await promptStorage.setItem(chatId, itemizedPrompts);
+    });
+    // Keep the queue usable after a failed write while reporting the failure below.
+    pendingSave = save.catch(() => {});
+    try {
+        await save;
         await eventSource.emit(event_types.ITEMIZED_PROMPTS_SAVED, { chatId: chatId });
     } catch {
         console.log('Error saving itemized prompts for chat', chatId);
@@ -67,13 +91,18 @@ export async function replaceItemizedPromptText(mesId, promptText) {
         itemizedPrompts = [];
     }
 
-    const itemizedPrompt = itemizedPrompts.find(x => x.mesId === mesId);
+    await pendingSave;
+    const prompts = itemizedPrompts;
+    const chatId = getCurrentChatId();
+    const index = prompts.findIndex(x => x.mesId === mesId);
+    const itemizedPrompt = index >= 0 ? await promptStorage.get(chatId, prompts[index]) : null;
 
     if (!itemizedPrompt) {
         return;
     }
 
     itemizedPrompt.rawPrompt = promptText;
+    prompts[index] = itemizedPrompt;
 }
 
 /**
@@ -86,7 +115,8 @@ export async function deleteItemizedPrompts(chatId) {
             return;
         }
 
-        await promptStorage.removeItem(chatId);
+        await pendingSave;
+        await promptStorage.delete(chatId);
         await eventSource.emit(event_types.ITEMIZED_PROMPTS_DELETED, { chatId: chatId, all: false });
     } catch {
         console.log('Error deleting itemized prompts for chat', chatId);
@@ -98,6 +128,8 @@ export async function deleteItemizedPrompts(chatId) {
  */
 export async function clearItemizedPrompts() {
     try {
+        await pendingSave;
+        ++loadVersion;
         await promptStorage.clear();
         itemizedPrompts = [];
         await eventSource.emit(event_types.ITEMIZED_PROMPTS_DELETED, { all: true });
@@ -226,34 +258,25 @@ export async function itemizedParams(itemizedPrompts, thisPromptSet, incomingMes
 }
 
 export function findItemizedPromptSet(itemizedPrompts, incomingMesId) {
-    let thisPromptSet = undefined;
-    priorPromptArrayItemForRawPromptDisplay = -1;
-
-    for (let i = 0; i < itemizedPrompts.length; i++) {
-        console.log(`looking for ${incomingMesId} vs ${itemizedPrompts[i].mesId}`);
-        if (itemizedPrompts[i].mesId === incomingMesId) {
-            console.log(`found matching mesID ${i}`);
-            thisPromptSet = i;
-            PromptArrayItemForRawPromptDisplay = i;
-            console.log(`wanting to raw display of ArrayItem: ${PromptArrayItemForRawPromptDisplay} which is mesID ${incomingMesId}`);
-            console.log(itemizedPrompts[thisPromptSet]);
-            break;
-        } else if (itemizedPrompts[i].rawPrompt) {
-            priorPromptArrayItemForRawPromptDisplay = i;
-        }
-    }
-    return thisPromptSet;
+    const index = itemizedPrompts.findIndex(prompt => prompt.mesId === incomingMesId);
+    return index >= 0 ? index : undefined;
 }
 
 export async function promptItemize(itemizedPrompts, requestedMesId) {
-    console.log('PROMPT ITEMIZE ENTERED');
+    const chatId = getCurrentChatId();
+    await pendingSave;
     var incomingMesId = Number(requestedMesId);
-    console.debug(`looking for MesId ${incomingMesId}`);
+    const index = itemizedPrompts.findIndex(prompt => prompt.mesId === incomingMesId);
+    if (index < 0) return null;
+    const selected = await promptStorage.get(chatId, itemizedPrompts[index]);
+    if (!selected || chatId !== getCurrentChatId()) return null;
+    const previous = itemizedPrompts.slice(0, index).findLast(prompt => prompt.rawPrompt || prompt.hasRawPrompt);
+    // Keep bodies local to this popup, so closing it releases them. The previous
+    // prompt is fetched only if the user requests a diff.
+    itemizedPrompts = previous ? [previous, selected] : [selected];
     var thisPromptSet = findItemizedPromptSet(itemizedPrompts, incomingMesId);
 
     if (thisPromptSet === undefined) {
-        console.log(`couldnt find the right mesId. looked for ${incomingMesId}`);
-        console.log(itemizedPrompts);
         return null;
     }
 
@@ -268,12 +291,14 @@ export async function promptItemize(itemizedPrompts, requestedMesId) {
 
     /** @type {HTMLElement} */
     const diffPrevPrompt = popup.dlg.querySelector('#diffPrevPrompt');
-    if (priorPromptArrayItemForRawPromptDisplay >= 0) {
+    if (previous) {
         diffPrevPrompt.style.display = '';
-        diffPrevPrompt.addEventListener('click', function () {
+        diffPrevPrompt.addEventListener('click', async function () {
+            const previousPrompt = await promptStorage.get(chatId, previous);
+            if (!previousPrompt) return;
             const dmp = new DiffMatchPatch();
-            const text1 = flatten(itemizedPrompts[priorPromptArrayItemForRawPromptDisplay].rawPrompt);
-            const text2 = flatten(itemizedPrompts[PromptArrayItemForRawPromptDisplay].rawPrompt);
+            const text1 = flatten(previousPrompt.rawPrompt);
+            const text2 = flatten(selected.rawPrompt);
 
             dmp.Diff_Timeout = 2.0;
 
@@ -293,7 +318,7 @@ export async function promptItemize(itemizedPrompts, requestedMesId) {
         diffPrevPrompt.style.display = 'none';
     }
     popup.dlg.querySelector('#copyPromptToClipboard').addEventListener('pointerup', async function () {
-        let rawPrompt = itemizedPrompts[PromptArrayItemForRawPromptDisplay].rawPrompt;
+        let rawPrompt = selected.rawPrompt;
         let rawPromptValues = rawPrompt;
 
         if (Array.isArray(rawPrompt)) {
@@ -305,12 +330,7 @@ export async function promptItemize(itemizedPrompts, requestedMesId) {
     });
 
     popup.dlg.querySelector('#showRawPrompt').addEventListener('click', async function () {
-        //console.log(itemizedPrompts[PromptArrayItemForRawPromptDisplay].rawPrompt);
-        console.log(PromptArrayItemForRawPromptDisplay);
-        console.log(itemizedPrompts);
-        console.log(itemizedPrompts[PromptArrayItemForRawPromptDisplay].rawPrompt);
-
-        const rawPrompt = flatten(itemizedPrompts[PromptArrayItemForRawPromptDisplay].rawPrompt);
+        const rawPrompt = flatten(selected.rawPrompt);
 
         // Mobile needs special handholding. The side-view on the popup wouldn't work,
         // so we just show an additional popup for this.
