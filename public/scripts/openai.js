@@ -2410,7 +2410,7 @@ function saveModelList(data) {
 /**
  * Sorts models by the specified property for the given source.
  * @param {object[]} data - Array of model objects
- * @param {string} property - Sort property ('alphabetically', 'context_length', 'pricing.prompt', 'pricing.completion')
+ * @param {string} property - Sort property ('alphabetically', 'created', 'context_length', 'pricing.prompt', 'pricing.completion')
  * @param {string} source - Chat Completion source (e.g., 'openrouter', 'chutes', 'electronhub', 'nanogpt')
  * @returns {object[]} Sorted array of model objects
  */
@@ -2418,7 +2418,9 @@ function sortModelsBy(data, property, source) {
     switch (source) {
         case chat_completion_sources.OPENROUTER:
             return data.sort((a, b) => {
-                if (property === 'context_length') {
+                if (property === 'created') {
+                    return (b.created || 0) - (a.created || 0);
+                } else if (property === 'context_length') {
                     return (b.context_length || 0) - (a.context_length || 0);
                 } else if (property === 'pricing.input' || property === 'pricing.prompt') {
                     return parseFloat(a.pricing?.prompt || 0) - parseFloat(b.pricing?.prompt || 0);
