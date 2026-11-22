@@ -37,7 +37,8 @@ export default async function corsProxyMiddleware(req, res) {
         const response = await fetch(url, {
             method: req.method,
             headers: headers,
-            body: bodyMethods.includes(req.method) ? JSON.stringify(req.body) : undefined,
+            // Multipart uploads are unparsed here; preserve their bytes and boundary.
+            body: bodyMethods.includes(req.method) ? (req.is('multipart/form-data') ? req : JSON.stringify(req.body)) : undefined,
         });
 
         const contentType = response.headers.get('content-type');
